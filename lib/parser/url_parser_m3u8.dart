@@ -22,31 +22,57 @@ import 'url_parser.dart';
 /// Handles caching, downloading, and parsing of HLS (M3U8) video streams.
 /// Implements the [UrlParser] interface for HLS video files.
 class UrlParserM3U8 implements UrlParser {
+  /// Tracks when M3U8 playlist cache entries were last fetched.
+  static final Map<String, DateTime> _m3u8CacheTimestamps = {};
+
+  /// TTL for M3U8 playlist cache entries in seconds.
+  /// After this duration, cached playlists are re-downloaded from CDN
+  /// so the player can pick up newly available quality variants (720p/1080p).
+  static const int m3u8CacheTtlSeconds = 30;
+
   /// Retrieves cached data for the given [task] from memory or file.
-  ///
-  /// Returns a [Uint8List] containing the cached data if available,
-  /// or `null` if the data is not cached.
+  /// For M3U8 playlists: enforces a 30-second TTL so the player receives
+  /// updated quality variants after backend transcoding completes.
+  /// For .ts segments and .key files: caches indefinitely (default behavior).
   @override
   Future<Uint8List?> cache(DownloadTask task) async {
+    final bool isM3u8 = VideoProxy.urlMatcherImpl.matchM3u8(task.uri);
+
+    // M3U8 TTL check — evict stale playlists to pick up new quality variants
+    if (isM3u8) {
+      final DateTime? cachedAt = _m3u8CacheTimestamps[task.matchUrl];
+      if (cachedAt != null &&
+          DateTime.now().difference(cachedAt).inSeconds > m3u8CacheTtlSeconds) {
+        logD('M3U8 cache expired (age: ${DateTime.now().difference(cachedAt).inSeconds}s): ${task.matchUrl}');
+        await LruCacheSingleton().memoryRemove(task.matchUrl);
+        await LruCacheSingleton().storageRemove(task.matchUrl);
+        _m3u8CacheTimestamps.remove(task.matchUrl);
+        return null;
+      }
+    }
+
     Uint8List? dataMemory = await LruCacheSingleton().memoryGet(task.matchUrl);
     if (dataMemory != null) {
       logD('From memory: ${dataMemory.lengthInBytes.toMemorySize}, '
           'total memory size: ${await LruCacheSingleton().memoryFormatSize()}');
+      if (isM3u8) {
+        _m3u8CacheTimestamps.putIfAbsent(task.matchUrl, () => DateTime.now());
+      }
       return dataMemory;
     }
     Uint8List? dataFile = await LruCacheSingleton().storageGet(task.matchUrl);
     if (dataFile != null) {
       logD('From file: ${task.matchUrl}');
       await LruCacheSingleton().memoryPut(task.matchUrl, dataFile);
+      if (isM3u8) {
+        _m3u8CacheTimestamps.putIfAbsent(task.matchUrl, () => DateTime.now());
+      }
       return dataFile;
     }
     return null;
   }
 
   /// Downloads data from the network for the given [task].
-  ///
-  /// Returns a [Uint8List] containing the downloaded data,
-  /// or `null` if the download fails.
   @override
   Future<Uint8List?> download(DownloadTask task) async {
     logD('From network: ${task.url}');
@@ -57,6 +83,10 @@ class UrlParserM3U8 implements UrlParser {
       if (taskStream.status == DownloadStatus.COMPLETED &&
           taskStream.url == task.url) {
         dataNetwork = Uint8List.fromList(taskStream.data);
+        // Record fresh download timestamp for M3U8 TTL tracking
+        if (VideoProxy.urlMatcherImpl.matchM3u8(task.uri)) {
+          _m3u8CacheTimestamps[task.matchUrl] = DateTime.now();
+        }
         break;
       }
     }
